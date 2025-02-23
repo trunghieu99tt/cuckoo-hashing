@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+const (
+	maxTryRehashing            = 3
+	writeBackoffWhileRehashing = time.Millisecond
+)
+
 // CuckooHashTable represents the cuckoo hash table structure
 type CuckooHashTable struct {
 	table1    []string
@@ -46,6 +51,11 @@ func (c *CuckooHashTable) hash2(key string) int {
 
 // insertWithoutRehash is a helper function that attempts insertion without triggering rehash
 func (c *CuckooHashTable) insertWithoutRehash(key string) bool {
+	for c.rehashing.Load() {
+		fmt.Println("Waiting for rehash to complete")
+		time.Sleep(time.Millisecond)
+	}
+
 	if c.Contains(key) {
 		return true
 	}
@@ -99,10 +109,9 @@ func (c *CuckooHashTable) insertWithoutRehash(key string) bool {
 }
 
 // prepareRehash checks if rehashing is needed and prepares a new table if so
-func (c *CuckooHashTable) prepareRehash() *CuckooHashTable {
+func (c *CuckooHashTable) prepareRehash(size int) *CuckooHashTable {
 	// Take a snapshot of the current table while holding the lock
 	c.mu.RLock()
-
 	// Create copies of the current tables
 	items := make([]string, 0, c.count)
 	for _, item := range c.table1 {
@@ -115,11 +124,10 @@ func (c *CuckooHashTable) prepareRehash() *CuckooHashTable {
 			items = append(items, item)
 		}
 	}
-	currentSize := c.size
 	c.mu.RUnlock()
 
 	// Create new table with double size
-	newTable := NewCuckooHashTable(currentSize * 2)
+	newTable := NewCuckooHashTable(size)
 
 	// Try to insert all items into new table
 	for _, item := range items {
@@ -135,30 +143,34 @@ func (c *CuckooHashTable) prepareRehash() *CuckooHashTable {
 // doRehash performs the rehashing operation
 func (c *CuckooHashTable) doRehash() bool {
 	// If already rehashing, wait for it to complete
-	if c.rehashing.Load() {
-		fmt.Println("Waiting for ongoing rehash")
-		for c.rehashing.Load() {
-			time.Sleep(time.Millisecond)
-		}
-		fmt.Println("Ongoing rehash completed")
-		return true
-	}
-
-	// Try to start rehashing
-	if !c.rehashing.CompareAndSwap(false, true) {
-		// Someone else started rehashing, wait for it
-		return c.doRehash()
+	for c.rehashing.Load() {
+		time.Sleep(time.Millisecond)
 	}
 
 	fmt.Println("Starting new rehash")
+	c.rehashing.Store(true)
 	defer c.rehashing.Store(false)
 
-	prepared := c.prepareRehash()
-	if prepared == nil {
-		fmt.Println("Rehash preparation failed")
-		return false
+	// prepare until success
+	var prepared *CuckooHashTable
+	size := c.size
+	for c.GetLoadFactor() >= 0.5 || prepared == nil {
+		size *= 2
+		// double the size until success
+		fmt.Println("Preparing rehash to size", size)
+		prepared = c.prepareRehash(size)
+		if prepared == nil {
+			time.Sleep(time.Millisecond)
+		} else {
+			c.swapTables(prepared)
+		}
 	}
 
+	return true
+}
+
+func (c *CuckooHashTable) swapTables(prepared *CuckooHashTable) {
+	fmt.Println("Rehashing to size", prepared.size)
 	// Acquire write lock only when ready to swap tables
 	c.mu.Lock()
 	c.table1 = prepared.table1
@@ -168,37 +180,22 @@ func (c *CuckooHashTable) doRehash() bool {
 	c.count = prepared.count
 	c.mu.Unlock()
 	fmt.Println("Rehash completed")
-
-	return true
 }
 
 // Insert adds a key to the hash table
 func (c *CuckooHashTable) Insert(key string) bool {
-	// First attempt without forcing rehash
-	loadFactor := c.GetLoadFactor()
-	if loadFactor >= 0.5 {
-		fmt.Println("Triggering proactive rehashing")
-		c.doRehash()
+	backoff := writeBackoffWhileRehashing
+	for c.rehashing.Load() {
+		time.Sleep(backoff)
+		backoff *= 2
 	}
 
-	c.mu.Lock()
-	if c.insertWithoutRehash(key) {
-		c.count++
-		c.mu.Unlock()
-		return true
-	}
-	c.mu.Unlock()
-
-	// If first attempt failed, force rehash and try again
-	fmt.Println("Insertion failed, forcing rehash")
-	if c.doRehash() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		fmt.Println("Rehashing completed, trying again")
+	for range maxTryRehashing {
 		if c.insertWithoutRehash(key) {
-			c.count++
+			c.count += 1
 			return true
 		}
+		c.doRehash()
 	}
 
 	return false
@@ -213,7 +210,13 @@ func (c *CuckooHashTable) Contains(key string) bool {
 
 // Remove deletes a key from the hash table
 func (c *CuckooHashTable) Remove(key string) bool {
-	c.mu.Lock() // Use write lock for modifications
+	backoff := writeBackoffWhileRehashing
+	for c.rehashing.Load() {
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+
+	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	pos1 := c.hash1(key)
@@ -256,11 +259,11 @@ func (c *CuckooHashTable) GetCount() int {
 
 func main() {
 	// Create a new cuckoo hash table
-	table := NewCuckooHashTable(10)
+	table := NewCuckooHashTable(4)
 
 	// try testing the rehashing concurrently
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		wg.Add(1)
 		i := i // Create new variable for goroutine
 		go func() {
